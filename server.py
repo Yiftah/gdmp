@@ -1,86 +1,118 @@
+#!/usr/bin/env python3
+"""
+Injection HTTP server that reads template filename from an environment variable.
+
+Usage:
+  export GOOGLE_CLIENT_ID="12345-...apps.googleusercontent.com"
+  export HTML_TEMPLATE="gdmp_gcp_patched.html"   # optional (defaults to gdmp_gcp_patched.html)
+  export PORT=8080                                # optional (defaults to 8080)
+  python server_inject.py
+"""
+
 import os
-import http.server
-import socketserver
-from urllib.parse import urlparse
-from dotenv import load_dotenv
+import sys
+from pathlib import Path
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+import urllib.parse
+import html as htmllib
 
-# Load environment variables from .env file
-load_dotenv()
-
-# --- CONFIGURATION ---
-HTML_FILE = 'gdmp.html'
-# The literal string used in the HTML file for replacement.
-# This must match the GOOGLE_CLIENT_ID constant in gdmp.html exactly.
-INJECTION_TARGET = '%%INJECTION_TARGET%%'
-
-# Get the port from the environment variable 'PORT' (for Render) 
-# and fallback to 8000 for local development.
-PORT = int(os.getenv('PORT', 8000))
-# Get the Client ID from the .env file
-client_id = os.getenv('GOOGLE_CLIENT_ID')
-
-if not client_id:
-    print("FATAL ERROR: GOOGLE_CLIENT_ID not found in .env file.")
-    print("Please create a .env file and set GOOGLE_CLIENT_ID.")
-    exit(1)
-
-def preprocess_html(filename):
-    """
-    Reads the HTML file, performs the client ID injection, and returns the modified content.
-    """
-    try:
-        with open(filename, 'r') as f:
-            content = f.read()
-        
-        # Replace the placeholder in the HTML with the real Client ID
-        modified_content = content.replace(INJECTION_TARGET, client_id)
-        return modified_content
-    except FileNotFoundError:
-        return None
-
-class Handler(http.server.SimpleHTTPRequestHandler):
-    """
-    Custom handler to intercept requests for the HTML file and inject the Client ID.
-    """
-    def do_GET(self):
-        url = urlparse(self.path)
-        
-        # Serve the index file for both the root path and the explicit file path
-        if url.path == '/' or url.path.endswith(HTML_FILE):
-            
-            # --- 1. Preprocess and Inject Client ID ---
-            modified_content = preprocess_html(HTML_FILE)
-
-            if modified_content is None:
-                self.send_error(404, "File not found")
-                return
-
-            # --- 2. Send Headers ---
-            self.send_response(200)
-            self.send_header("Content-type", "text/html")
-            self.send_header("Content-length", str(len(modified_content)))
-            self.end_headers()
-            
-            # --- 3. Send Content ---
-            self.wfile.write(modified_content.encode('utf-8'))
-        else:
-            # Fallback to default SimpleHTTPRequestHandler for other assets (like favicon)
-            super().do_GET()
-
-# --- SERVER EXECUTION ---
-
-# Ensure the server binds to all network interfaces (0.0.0.0) for deployment, 
-# but uses localhost locally.
-HOST = '0.0.0.0' if os.getenv('PORT') else '127.0.0.1'
-
+# Optional: load .env if python-dotenv is installed
 try:
-    with socketserver.TCPServer((HOST, PORT), Handler) as httpd:
-        print(f"--- Server running on http://{HOST}:{PORT}/ ---")
-        print(f"Access application at: http://127.0.0.1:{PORT}/{HTML_FILE}")
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# ===== Configuration via environment =====
+CLIENT_ENV_VAR = "GOOGLE_CLIENT_ID"           # must contain a *.apps.googleusercontent.com id
+DEFAULT_TEMPLATE = "gdmp.html"    # fallback if HTML_TEMPLATE not set
+TOKEN = "%%INJECTION_TARGET%%"                # exact token to replace in HTML
+DEFAULT_PORT = int(os.getenv("PORT", 8080))
+
+# Read template name from env variable, but accept only a basename to avoid path traversal
+_template_env = os.getenv("HTML_TEMPLATE", DEFAULT_TEMPLATE).strip()
+HTML_NAME = Path(_template_env).name  # take basename only
+BASE_DIR = Path(__file__).resolve().parent
+
+def _get_client_id():
+    cid = (os.getenv(CLIENT_ENV_VAR) or "").strip()
+    if not cid:
+        raise RuntimeError(f"{CLIENT_ENV_VAR} not set in environment.")
+    if not cid.endswith(".apps.googleusercontent.com"):
+        raise RuntimeError(f"{CLIENT_ENV_VAR} value doesn't look like a web OAuth client id.")
+    return cid
+
+def preprocess_html(filename: str) -> bytes:
+    path = (BASE_DIR / filename).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Template not found: {path}")
+    raw = path.read_text(encoding="utf-8")
+    client_id = _get_client_id()
+    if TOKEN not in raw:
+        raise RuntimeError(f"Placeholder token {TOKEN!r} not found in {filename}.")
+    out = raw.replace(TOKEN, client_id)
+    if TOKEN in out:
+        raise RuntimeError("Injection failed: placeholder still present after replacement.")
+    return out.encode("utf-8")
+
+class InjectingHandler(SimpleHTTPRequestHandler):
+    def _respond_with_html_bytes(self, body: bytes, code: int = 200):
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _respond_with_error_page(self, exc: Exception):
+        body_text = (
+            "<html><head><meta charset='utf-8'><title>Server Error</title></head>"
+            "<body style='font-family:system-ui, -apple-system, Roboto, Arial; padding:24px;'>"
+            "<h1>HTML preprocessing error</h1>"
+            "<pre style='white-space:pre-wrap; background:#f8f8f8; padding:12px; border:1px solid #ddd;'>"
+            f"{htmllib.escape(str(exc))}"
+            "</pre>"
+            "<p>Check server logs or environment variables (see server console output).</p>"
+            "</body></html>"
+        ).encode("utf-8")
+        self._respond_with_html_bytes(body_text, code=500)
+
+    def do_GET(self):
+        clean_path = urllib.parse.urlsplit(self.path).path
+        # Accept root, /gdmp, or the configured filename
+        intercept_paths = ("/", "/gdmp", f"/{HTML_NAME}", f"/{HTML_NAME}/")
+        if clean_path in intercept_paths:
+            try:
+                body = preprocess_html(HTML_NAME)
+                return self._respond_with_html_bytes(body, code=200)
+            except Exception as e:
+                print("[ERROR] HTML preprocessing failed:", file=sys.stderr)
+                import traceback
+                traceback.print_exc()
+                return self._respond_with_error_page(e)
+
+        # Otherwise serve static files from BASE_DIR
+        cwd_save = os.getcwd()
+        try:
+            os.chdir(str(BASE_DIR))
+            return super().do_GET()
+        finally:
+            os.chdir(cwd_save)
+
+def run(port: int):
+    addr = ("0.0.0.0", port)
+    print(f"Starting injecting server on http://127.0.0.1:{port}/ (serving from {BASE_DIR})")
+    print(f"Template: {HTML_NAME} (token: {TOKEN}) -- requests to / or /{HTML_NAME} will be injected.")
+    httpd = ThreadingHTTPServer(addr, InjectingHandler)
+    try:
         httpd.serve_forever()
-except OSError as e:
-    if e.errno == 98: # Address already in use
-        print(f"ERROR: Port {PORT} is already in use. Please stop the other application or choose a different port.")
-    else:
-        raise
-        
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+    finally:
+        httpd.server_close()
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", DEFAULT_PORT))
+    print(f"PORT={port}; {CLIENT_ENV_VAR}={'set' if os.getenv(CLIENT_ENV_VAR) else 'NOT SET'}; HTML_TEMPLATE={HTML_NAME}")
+    run(port)

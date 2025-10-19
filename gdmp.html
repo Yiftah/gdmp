@@ -10,8 +10,10 @@
     
     <!-- Load Google Platform Libraries for Identity and API Client -->
     <!-- The onload attributes rely on the functions being defined below before they execute. -->
-    <script async defer src="https://apis.google.com/js/api.js" onload="gapiLoaded()"></script>
-    <script async defer src="https://accounts.google.com/gsi/client" onload="gisLoaded()"></script>
+    <script async defer src="https://apis.google.com/js/api.js"
+            onload="window.__gapiOnLoad && window.__gapiOnLoad()"></script>
+    <script async defer src="https://accounts.google.com/gsi/client"
+            onload="window.__gisOnLoad && window.__gisOnLoad()"></script>
 
     <style>
         :root {
@@ -72,7 +74,34 @@
         
         // --- GOOGLE API INITIALIZATION CALLBACKS (Called by async scripts in <head>) ---
 
-        function gapiLoaded() {
+        // --- RESILIENT LOAD HANDLERS (idempotent) ---
+        const waitFor = (testFn, { timeoutMs = 10000, intervalMs = 50 } = {}) =>
+          new Promise((resolve, reject) => {
+            const start = Date.now();
+            (function poll() {
+              try { if (testFn()) return resolve(); } catch(_) {}
+              if (Date.now() - start > timeoutMs) return reject(new Error('Timeout'));
+              setTimeout(poll, intervalMs);
+            })();
+          });
+
+        window.__gapiOnLoad = function __gapiOnLoad() {
+            if (window.gapi && gapi.load) gapi.load('client', initializeGapiClient);
+        };
+
+        window.__gisOnLoad = function __gisOnLoad() {
+            if (!window.google || !google.accounts || !google.accounts.oauth2) return;
+            if (typeof tokenClient !== 'undefined' && tokenClient) return;
+            tokenClient = google.accounts.oauth2.initTokenClient({
+                client_id: GOOGLE_CLIENT_ID,
+                scope: SCOPE,
+                callback: () => {}, // assigned on auth click
+            });
+            gisInited = true;
+            startOnceReady();
+        };
+
+        function gapiLoaded() { window.__gapiOnLoad && window.__gapiOnLoad(); 
             gapi.load('client', initializeGapiClient);
         }
 
@@ -84,7 +113,7 @@
             maybeInitApp();
         }
 
-        function gisLoaded() {
+        function gisLoaded() { window.__gisOnLoad && window.__gisOnLoad(); 
             tokenClient = google.accounts.oauth2.initTokenClient({
                 client_id: GOOGLE_CLIENT_ID,
                 scope: SCOPE,
@@ -132,19 +161,26 @@
          * placeholder string, PLACEHOLDER_FOR_CHECK.
          */
         function checkClientId() {
-            // If GOOGLE_CLIENT_ID is still the literal string PLACEHOLDER_FOR_CHECK, 
-            // it means the Python replacement FAILED.
-            if (GOOGLE_CLIENT_ID === PLACEHOLDER_FOR_CHECK) {
+            const id = (GOOGLE_CLIENT_ID || '').trim();
+            const looksInjected =
+              id &&
+              !id.includes('INJECTION_TARGET') &&
+              !id.includes('PLACEHOLDER') &&
+              id.endsWith('.apps.googleusercontent.com');
+            if (!looksInjected) {
                 if (authStatusEl) {
-                    authStatusEl.innerHTML = `<span class="text-red-500 font-bold">SETUP ERROR: Client ID not injected. Check serve.py and .env.</span>`;
+                    authStatusEl.innerHTML = '<span class="text-red-500 font-bold">SETUP ERROR: Client ID not injected. Check serve.py and .env.</span>';
                 }
-                if (authButton) {
-                    authButton.disabled = true;
-                }
+                if (authButton) authButton.disabled = true;
                 return false;
-            } 
+            }
             return true;
-        }    </script>
+        }
+
+        // Re-export stubs for compatibility
+        function gapiLoaded() { window.__gapiOnLoad && window.__gapiOnLoad(); }
+        function gisLoaded() { window.__gisOnLoad && window.__gisOnLoad(); }
+    </script>
 </head>
 <body class="p-4 sm:p-8 flex justify-center items-start">
 
@@ -705,6 +741,25 @@
 
 
         // --- MAIN INITIALIZATION (Runs AFTER all HTML elements are loaded) ---
+        async function startOnceReady() {
+            isDomReady = true;
+            try {
+                await Promise.all([
+                    waitFor(() => window.gapi && gapi.client),
+                    waitFor(() => window.google && google.accounts && google.accounts.oauth2),
+                ]);
+                if (!gapiInited) await initializeGapiClient();
+                if (!gisInited) window.__gisOnLoad && window.__gisOnLoad();
+                maybeInitApp();
+            } catch (e) {
+                console.error('Library load timeout:', e);
+                if (authStatusEl) {
+                    authStatusEl.innerHTML = '<span class="text-red-400">Failed to load Google libraries. Please refresh.</span>';
+                }
+            }
+        }
+
+
         document.addEventListener('DOMContentLoaded', () => {
             // Assign DOM elements to global variables
             authButton = document.getElementById('authButton');
@@ -725,7 +780,8 @@
             isDomReady = true; 
             
             // Set initial status and attempt to initialize
-            maybeInitApp(); 
+            //maybeInitApp(); 
+            startOnceReady();
             
             // Initial playlist render
             renderPlaylist(); 
