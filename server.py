@@ -1,88 +1,86 @@
 import os
-from http.server import SimpleHTTPRequestHandler, HTTPServer
+import http.server
+import socketserver
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 
-# --- CONFIGURATION ---
 # Load environment variables from .env file
 load_dotenv()
 
-# The environment variable key holding your secret Client ID
-ENV_VAR_NAME = 'GOOGLE_CLIENT_ID'
-# File name of your HTML client
+# --- CONFIGURATION ---
 HTML_FILE = 'gdmp.html'
-# The literal string placeholder used in the HTML file
-PLACEHOLDER = '%%INJECTION_TARGET%%'
-PORT = 8000
+# The literal string used in the HTML file for replacement.
+# This must match the GOOGLE_CLIENT_ID constant in gdmp.html exactly.
+INJECTION_TARGET = '%%INJECTION_TARGET%%'
 
-# --- PREPROCESSING LOGIC ---
+# Get the port from the environment variable 'PORT' (for Render) 
+# and fallback to 8000 for local development.
+PORT = int(os.getenv('PORT', 8000))
+# Get the Client ID from the .env file
+client_id = os.getenv('GOOGLE_CLIENT_ID')
 
-def preprocess_html(file_path):
+if not client_id:
+    print("FATAL ERROR: GOOGLE_CLIENT_ID not found in .env file.")
+    print("Please create a .env file and set GOOGLE_CLIENT_ID.")
+    exit(1)
+
+def preprocess_html(filename):
     """
-    Reads the HTML content, injects the Google Client ID, and returns the modified content.
+    Reads the HTML file, performs the client ID injection, and returns the modified content.
     """
-    client_id = os.getenv(ENV_VAR_NAME)
-    
-    if not client_id:
-        print(f"\nFATAL ERROR: Environment variable '{ENV_VAR_NAME}' not found in .env file.")
-        print("Please ensure your .env file exists and contains GOOGLE_CLIENT_ID=\"YOUR_ID\"")
-        # Return a non-functional content to ensure the browser doesn't load sensitive info
-        return f"<html><body><h1>SETUP ERROR: Missing {ENV_VAR_NAME} environment variable.</h1></body></html>"
-
     try:
-        with open(file_path, 'r') as f:
+        with open(filename, 'r') as f:
             content = f.read()
+        
+        # Replace the placeholder in the HTML with the real Client ID
+        modified_content = content.replace(INJECTION_TARGET, client_id)
+        return modified_content
     except FileNotFoundError:
-        return f"<html><body><h1>Error 404: {file_path} not found in the current directory.</h1></body></html>"
-    
-    # Securely replace the placeholder with the actual client ID
-    modified_content = content.replace(PLACEHOLDER, client_id)
-    
-    # We expect the content to change. If it didn't, it means the placeholder was wrong.
-    if modified_content == content:
-        print(f"\nWARNING: Placeholder '{PLACEHOLDER}' was NOT replaced.")
-        print("Ensure the string in serve.py EXACTLY matches the string in gdmp.html.")
-    
-    return modified_content
+        return None
 
-# --- CUSTOM HTTP HANDLER ---
-
-class CustomHandler(SimpleHTTPRequestHandler):
+class Handler(http.server.SimpleHTTPRequestHandler):
+    """
+    Custom handler to intercept requests for the HTML file and inject the Client ID.
+    """
     def do_GET(self):
-        # We only care about requests for the HTML file or the root directory.
-        if self.path.endswith(HTML_FILE) or self.path == '/':
-            # If the root is requested, implicitly serve the HTML file
-            if self.path == '/':
-                serve_file = HTML_FILE
-            else:
-                serve_file = self.path[1:] # Remove leading slash
+        url = urlparse(self.path)
+        
+        # Serve the index file for both the root path and the explicit file path
+        if url.path == '/' or url.path.endswith(HTML_FILE):
             
-            # 1. Preprocess the HTML content
-            modified_content = preprocess_html(serve_file)
-            
-            # 2. Convert content to bytes and send header
+            # --- 1. Preprocess and Inject Client ID ---
+            modified_content = preprocess_html(HTML_FILE)
+
+            if modified_content is None:
+                self.send_error(404, "File not found")
+                return
+
+            # --- 2. Send Headers ---
             self.send_response(200)
-            self.send_header('Content-type', 'text/html')
+            self.send_header("Content-type", "text/html")
+            self.send_header("Content-length", str(len(modified_content)))
             self.end_headers()
             
-            # 3. Send the modified content to the browser
+            # --- 3. Send Content ---
             self.wfile.write(modified_content.encode('utf-8'))
         else:
-            # For all other requests (like favicon, JS libraries, etc.), use default handler
+            # Fallback to default SimpleHTTPRequestHandler for other assets (like favicon)
             super().do_GET()
 
-# --- SERVER STARTUP ---
+# --- SERVER EXECUTION ---
 
-if __name__ == '__main__':
-    # Ensure the HTML file exists before starting
-    if not os.path.exists(HTML_FILE):
-         print(f"Error: {HTML_FILE} not found. Please ensure it is in the same directory.")
+# Ensure the server binds to all network interfaces (0.0.0.0) for deployment, 
+# but uses localhost locally.
+HOST = '0.0.0.0' if os.getenv('PORT') else '127.0.0.1'
+
+try:
+    with socketserver.TCPServer((HOST, PORT), Handler) as httpd:
+        print(f"--- Server running on http://{HOST}:{PORT}/ ---")
+        print(f"Access application at: http://127.0.0.1:{PORT}/{HTML_FILE}")
+        httpd.serve_forever()
+except OSError as e:
+    if e.errno == 98: # Address already in use
+        print(f"ERROR: Port {PORT} is already in use. Please stop the other application or choose a different port.")
     else:
-        server_address = ('', PORT)
-        httpd = HTTPServer(server_address, CustomHandler)
-        print(f"Starting server at http://localhost:{PORT}")
-        print(f"Access your app at: http://localhost:{PORT}/{HTML_FILE}")
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("\nServer stopped.")
-            httpd.server_close()
+        raise
+        
