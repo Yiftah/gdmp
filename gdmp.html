@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Drive Streamer | Music Player</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎵</text></svg>">
+    
+    <!-- Load Google Platform Libraries for Identity and API Client -->
+    <!-- The onload attributes rely on the functions being defined below before they execute. -->
+    <script async defer src="https://apis.google.com/js/api.js" onload="gapiLoaded()"></script>
+    <script async defer src="https://accounts.google.com/gsi/client" onload="gisLoaded()"></script>
+
+    <style>
+        :root {
+            --primary: #4f46e5;
+            --secondary: #8b5cf6;
+            --dark-bg: #1f2937;
+            --card-bg: #374151;
+        }
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--dark-bg);
+            color: #f3f4f6;
+            min-height: 100vh;
+        }
+        .scroll-container {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        /* Custom Scrollbar for better aesthetics */
+        .scroll-container::-webkit-scrollbar {
+            width: 8px;
+        }
+        .scroll-container::-webkit-scrollbar-thumb {
+            background-color: var(--secondary);
+            border-radius: 4px;
+        }
+        .scroll-container::-webkit-scrollbar-track {
+            background: var(--card-bg);
+        }
+    </style>
+
+    <!-- API INITIALIZATION FUNCTIONS: Moved here to the HEAD for synchronous definition -->
+    <script>
+        // --- GLOBAL CONFIGURATION & STATE ---
+        const HTML_FILE = 'gdmp.html';
+        
+        // This is the unique placeholder string used by the Python server (serve.py) to inject the real Client ID.
+        // 1. PLACEHOLDER_FOR_CHECK: This must be a literal string that NEVER changes.
+        // We use this value in the JS check to see if the Python replacement occurred.
+        const PLACEHOLDER_FOR_CHECK = 'SETUP_PLACEHOLDER_LITERAL'; 
+
+        // 2. GOOGLE_CLIENT_ID: This must be the string that the Python script targets.
+        // The Python script will replace '%%INJECTION_TARGET%%' with the real Client ID.
+        const GOOGLE_CLIENT_ID = '%%INJECTION_TARGET%%';
+
+        // --- CONFIGURABLE ROOT FOLDER ---
+        // Change this name to the exact name of your main music folder in Google Drive.
+        const CUSTOM_ROOT_FOLDER_NAME = 'Music'; 
+        
+        const SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
+        const DISCOVERY_DOCS = ["https://www.googleapis.com/discovery/v1/apis/drive/v3/rest"];
+
+        // --- GLOBAL STATE ---
+        let tokenClient;
+        let gapiInited = false;
+        let gisInited = false;
+        let isDomReady = false; // Flag to ensure DOM elements are ready before use
+        
+        // --- GOOGLE API INITIALIZATION CALLBACKS (Called by async scripts in <head>) ---
+
+        function gapiLoaded() {
+            gapi.load('client', initializeGapiClient);
+        }
+
+        async function initializeGapiClient() {
+            await gapi.client.init({
+                discoveryDocs: DISCOVERY_DOCS,
+            });
+            gapiInited = true;
+            maybeInitApp();
+        }
+
+        function gisLoaded() {
+            tokenClient = google.accounts.oauth2.initTokenClient({
+                client_id: GOOGLE_CLIENT_ID,
+                scope: SCOPE,
+                callback: (tokenResponse) => {
+                    // This initial callback is only set up during the GIS client initialization
+                },
+            });
+            gisInited = true;
+            maybeInitApp();
+        }
+
+        /**
+         * Checks if both API libraries and the DOM are ready.
+         * Enables the auth button if all is ready.
+         */
+        function maybeInitApp() {
+            // FIX: If the DOM is not ready, stop execution and wait for DOMContentLoaded to set the flag.
+            if (!isDomReady) {
+                return;
+            }
+
+            if (gapiInited && gisInited) {
+                console.log("--- GOOGLE API STATUS ---");
+                console.log("APIs Loaded: OK");
+
+                // Only enable the button if the client ID check passes
+                if (checkClientId()) {
+                    authButton.disabled = false;
+                    authButton.classList.remove('bg-gray-500'); 
+                    authStatusEl.innerHTML = '<span class="text-yellow-400">Ready to Connect</span>';
+                } else {
+                    // Client ID check failed, keep button disabled and show error
+                    authButton.disabled = true;
+                }
+            } else {
+                // Keep button disabled while scripts are loading
+                authButton.disabled = true;
+                authStatusEl.innerHTML = '<span class="text-yellow-400">Loading APIs...</span>'; 
+            }
+        }
+
+        /**
+         * Checks if the Client ID has been successfully replaced by the server.
+         * The check passes only if GOOGLE_CLIENT_ID does NOT equal the literal
+         * placeholder string, PLACEHOLDER_FOR_CHECK.
+         */
+        function checkClientId() {
+            // If GOOGLE_CLIENT_ID is still the literal string PLACEHOLDER_FOR_CHECK, 
+            // it means the Python replacement FAILED.
+            if (GOOGLE_CLIENT_ID === PLACEHOLDER_FOR_CHECK) {
+                if (authStatusEl) {
+                    authStatusEl.innerHTML = `<span class="text-red-500 font-bold">SETUP ERROR: Client ID not injected. Check serve.py and .env.</span>`;
+                }
+                if (authButton) {
+                    authButton.disabled = true;
+                }
+                return false;
+            } 
+            return true;
+        }    </script>
+</head>
+<body class="p-4 sm:p-8 flex justify-center items-start">
+
+    <div id="app" class="w-full max-w-4xl bg-gray-800 shadow-2xl rounded-xl p-4 sm:p-6 space-y-6">
+
+        <!-- Header and Auth Status -->
+        <header class="flex flex-col sm:flex-row justify-between items-center border-b border-gray-700 pb-4">
+            <h1 class="text-3xl font-bold text-white tracking-tight">Cloud Music Library</h1>
+            <div id="authStatus" class="mt-2 sm:mt-0 text-sm font-medium">
+                <span class="text-yellow-400">Loading APIs...</span>
+            </div>
+        </header>
+
+        <!-- Current Player Panel -->
+        <div class="bg-gray-700 p-5 rounded-lg shadow-inner flex flex-col sm:flex-row items-center space-y-4 sm:space-y-0 sm:space-x-6">
+            <div class="w-20 h-20 bg-gray-600 rounded-lg flex items-center justify-center flex-shrink-0 text-white font-bold text-xl">
+                <!-- Placeholder for Album Art -->
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-8 h-8">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M9 9l10.5-3m0 6.5l-10.5 3.5m0 0a3 3 0 110-6 3 3 0 010 6zm10.5 0a3 3 0 110-6 3 3 0 010 6z" />
+                </svg>
+            </div>
+            <div class="flex-grow text-center sm:text-left min-w-0">
+                <p id="currentTitle" class="text-xl font-semibold truncate text-white">Select a track to play</p>
+                <p id="currentArtist" class="text-sm text-gray-400">Offline</p>
+            </div>
+            
+            <!-- Hidden HTML Audio Element -->
+            <audio id="audioPlayer" controls class="w-full sm:w-auto mt-4 sm:mt-0 rounded-lg shadow-lg"></audio>
+        </div>
+
+        <!-- Library and Playlist Section -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+
+            <!-- Library (File Browser) -->
+            <div class="bg-gray-700 p-4 rounded-lg">
+                <h2 class="text-xl font-semibold mb-3 text-white">Google Drive Files (Library)</h2>
+                
+                <!-- Authentication Button: DISABLED by default until scripts load -->
+                <button id="authButton" onclick="handleAuthClick()" class="w-full mb-3 py-2 bg-indigo-600 hover:bg-indigo-700 rounded-md text-white font-medium transition duration-150" disabled>
+                    Sign in to Google Drive
+                </button>
+                <button id="signoutButton" onclick="handleSignoutClick()" class="w-full mb-3 py-2 bg-red-600 hover:bg-red-700 rounded-md text-white font-medium transition duration-150 hidden">
+                    Sign Out
+                </button>
+
+                <!-- Navigation Panel & Search -->
+                <div id="navigationPanel" class="mb-3 space-y-2">
+                    <!-- Dynamic navigation (Back button, Current Folder Name) will be placed here -->
+                    <input type="text" id="searchBar" oninput="listDriveFiles(currentFolderId, true)" placeholder="Search current folder..." 
+                        class="w-full p-2 rounded-md bg-gray-600 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 hidden">
+                </div>
+
+                <div id="fileList" class="scroll-container border border-gray-600 rounded-md divide-y divide-gray-600">
+                    <p class="p-3 text-gray-400 text-sm">Sign in to load your music library.</p>
+                </div>
+            </div>
+
+            <!-- Current Playlist -->
+            <div class="bg-gray-700 p-4 rounded-lg">
+                <h2 class="text-xl font-semibold mb-3 text-white">Current Playlist</h2>
+                <div id="playlist" class="scroll-container border border-gray-600 rounded-md divide-y divide-gray-600">
+                    <p class="p-3 text-gray-400 text-sm">Add tracks from the library to build your playlist.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- DOM Elements (Assigned later, but defined globally) ---
+        let authButton;
+        let authStatusEl;
+        let signoutButton;
+        let searchBar;
+        let audioPlayer;
+        let fileListContainer;
+        let playlistContainer;
+        let currentTitleEl;
+        let currentArtistEl;
+        let navigationPanel;
+
+        // --- DRIVE STATE ---
+        let accessToken = null;
+        let currentFolderId = 'root'; // ID of the currently displayed folder
+        let rootFolderId = 'root'; // The ID we use as the navigation "ceiling"
+        let currentPlaylist = [];
+        let currentTrackIndex = -1;
+        let currentBlobUrl = null; // Variable to hold the URL object for cleanup
+
+
+        // --- AUTHENTICATION HANDLERS ---
+
+        /**
+         * Searches for a specified folder name anywhere in the user's drive.
+         * @param {string} folderName The name of the folder to search for.
+         * @returns {string | null} The ID of the found folder, or null.
+         */
+        async function findRootFolder(folderName) {
+            // NOTE: We do NOT include 'root' in parents, allowing us to find it anywhere
+            const query = `name = '${folderName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+            try {
+                const response = await gapi.client.drive.files.list({
+                    q: query,
+                    fields: 'files(id, name)',
+                    pageSize: 1
+                });
+                const files = response.result.files;
+                if (files && files.length > 0) {
+                    return files[0].id;
+                }
+                return null;
+            } catch (error) {
+                console.error("Error searching for root folder:", error);
+                return null;
+            }
+        }
+
+        async function updateAuthStatus(isSignedIn) {
+            if (isSignedIn) {
+                authStatusEl.innerHTML = '<span class="text-green-400">Connected to Drive</span>';
+                authButton.classList.add('hidden');
+                signoutButton.classList.remove('hidden');
+                searchBar.classList.remove('hidden');
+
+                let startFolderId = 'root';
+                if (CUSTOM_ROOT_FOLDER_NAME) {
+                    fileListContainer.innerHTML = `<p class="p-3 text-indigo-400 text-sm">Searching for custom root: "${CUSTOM_ROOT_FOLDER_NAME}"...</p>`;
+                    const customId = await findRootFolder(CUSTOM_ROOT_FOLDER_NAME);
+                    if (customId) {
+                        startFolderId = customId;
+                        rootFolderId = customId; // Set the custom folder as the navigational ceiling
+                        authStatusEl.innerHTML = `<span class="text-green-400">Connected to "${CUSTOM_ROOT_FOLDER_NAME}"</span>`;
+                    } else {
+                        rootFolderId = 'root';
+                        authStatusEl.innerHTML = `<span class="text-yellow-400">Note: Folder "${CUSTOM_ROOT_FOLDER_NAME}" not found. Starting at My Drive root.</span>`;
+                    }
+                }
+                
+                // Set the determined start folder and list files
+                currentFolderId = startFolderId;
+                listDriveFiles(currentFolderId); 
+
+            } else {
+                authStatusEl.innerHTML = '<span class="text-yellow-400">Not Connected</span>';
+                authButton.classList.remove('hidden');
+                signoutButton.classList.add('hidden');
+                searchBar.classList.add('hidden');
+                fileListContainer.innerHTML = '<p class="p-3 text-gray-400 text-sm">Sign in to load your music library.</p>';
+                navigationPanel.innerHTML = '';
+                currentFolderId = 'root';
+                rootFolderId = 'root';
+                currentPlaylist = [];
+                currentTrackIndex = -1;
+                renderPlaylist();
+                audioPlayer.pause();
+                audioPlayer.src = '';
+                currentTitleEl.textContent = 'Select a track to play';
+                currentArtistEl.textContent = 'Offline';
+                searchBar.value = ''; // Clear search bar on sign out
+                
+                maybeInitApp();
+            }
+        }
+
+        function handleAuthClick() {
+            if (!tokenClient) {
+                authStatusEl.innerHTML = '<span class="text-red-400">Error: GIS client not initialized. Try refreshing.</span>';
+                return;
+            }
+            tokenClient.callback = async (tokenResponse) => {
+                if (tokenResponse && tokenResponse.access_token) {
+                    accessToken = tokenResponse.access_token;
+                    gapi.client.setToken({ access_token: accessToken });
+                    updateAuthStatus(true);
+                } else {
+                    console.error("Failed to get access token:", tokenResponse);
+                    authStatusEl.innerHTML = '<span class="text-red-400">Authentication Failed! Check Client ID & Origin in Cloud Console.</span>';
+                }
+            };
+            tokenClient.requestAccessToken();
+        }
+
+        function handleSignoutClick() {
+            if (accessToken) {
+                google.accounts.oauth2.revoke(accessToken, () => {
+                    accessToken = null;
+                    gapi.client.setToken(null);
+                    updateAuthStatus(false);
+                });
+            } else {
+                updateAuthStatus(false);
+            }
+        }
+
+        // --- DRIVE NAVIGATION & API FUNCTIONS ---
+
+        /**
+         * Changes the current folder and reloads the file list.
+         * @param {string} folderId The ID of the folder to open.
+         */
+        function openFolder(folderId) {
+            currentFolderId = folderId;
+            searchBar.value = ''; // Clear search when opening a new folder
+            listDriveFiles(folderId);
+        }
+
+        /**
+         * Navigates back to the root of the library (My Drive or Custom Root).
+         */
+        function goToRoot() {
+            openFolder(rootFolderId);
+        }
+        
+        /**
+         * Navigates up one level to the parent folder.
+         */
+        async function goToParent(currentId) {
+            try {
+                // 1. Get metadata for the current folder to find its parents
+                const response = await gapi.client.drive.files.get({
+                    fileId: currentId,
+                    fields: 'parents'
+                });
+                
+                const parents = response.result.parents;
+                
+                if (parents && parents.length > 0) {
+                    const parentId = parents[0];
+
+                    if (parentId === rootFolderId || currentId === rootFolderId) {
+                        // If the parent is the root ceiling, or we are already at the root, navigate to the root ceiling
+                        openFolder(rootFolderId);
+                    } else {
+                        // Navigate to the actual parent folder
+                        openFolder(parentId);
+                    }
+                } else if (currentId !== 'root') {
+                    // If no parent found (e.g., at Drive root), just ensure we are at the top ceiling
+                    openFolder(rootFolderId);
+                }
+            } catch (error) {
+                console.error("Error navigating up to parent folder:", error);
+                authStatusEl.innerHTML = `<span class="text-red-400">Navigation Error: Failed to find parent.</span>`;
+            }
+        }
+
+
+        /**
+         * Fetches audio files AND folders from the current Google Drive location.
+         * @param {string} parentId The ID of the folder to search within.
+         * @param {boolean} isSearch Whether this call is triggered by the search bar.
+         */
+        async function listDriveFiles(parentId = currentFolderId, isSearch = false) {
+            fileListContainer.innerHTML = '<p class="p-3 text-indigo-400 text-sm">Loading files and folders...</p>';
+            
+            const searchTerm = searchBar.value.trim();
+            
+            // Base query: children of parentId AND (audio OR folder)
+            let query = `'${parentId}' in parents and (mimeType contains 'audio/' or mimeType = 'application/vnd.google-apps.folder') and trashed = false`;
+            
+            if (isSearch && searchTerm) {
+                // If searching, add a name filter
+                query += ` and name contains '${searchTerm}'`;
+            }
+
+            try {
+                const response = await gapi.client.drive.files.list({
+                    q: query, 
+                    pageSize: 100,
+                    // Request parents field for navigation and mimeType for file distinction
+                    fields: 'nextPageToken, files(id, name, mimeType, parents)', 
+                    orderBy: 'folder, name',
+                });
+
+                const files = response.result.files || [];
+                
+                if (files.length > 0) {
+                    renderFileList(files);
+                } else {
+                    fileListContainer.innerHTML = '<p class="p-3 text-gray-400 text-sm">This folder is empty or no results found.</p>';
+                }
+
+                renderNavigation(parentId, files); // Update the navigation UI after loading
+
+            } catch (error) {
+                let errorMessage = "Unknown API Error. See console for full details.";
+                if (error.result && error.result.error && error.result.error.message) {
+                    errorMessage = error.result.error.message;
+                } else if (error.message) {
+                    errorMessage = error.message;
+                }
+
+                console.error("Error listing files:", error);
+                fileListContainer.innerHTML = `<p class="p-3 text-red-400 text-sm">Error loading files: ${errorMessage}</p>`;
+                authStatusEl.innerHTML = `<span class="text-red-400">API Query Failed: ${errorMessage}</span>`;
+            }
+        }
+
+        // --- PLAYER LOGIC ---
+        
+        /**
+         * Uses the Fetch API with the access token to securely retrieve the audio file as a blob 
+         */
+        async function fetchAndPlayTrack(track, trackIndex) {
+            if (currentBlobUrl) {
+                URL.revokeObjectURL(currentBlobUrl);
+                currentBlobUrl = null;
+            }
+
+            currentTrackIndex = trackIndex;
+            
+            renderPlaylist();
+
+            currentTitleEl.textContent = track.name.replace(/\.(mp3|flac|wav|ogg)$/i, '');
+            currentArtistEl.textContent = track.artist || 'Unknown Artist';
+            
+            // Ensure the UI shows streaming progress
+            authStatusEl.innerHTML = '<span class="text-indigo-400">Streaming Track...</span>';
+
+            const streamUrl = `https://www.googleapis.com/drive/v3/files/${track.id}?alt=media`;
+
+            try {
+                const response = await fetch(streamUrl, {
+                    method: 'GET',
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`,
+                    }
+                });
+
+                if (response.status === 404) {
+                    throw new Error(`File not found or permissions denied.`);
+                }
+                if (!response.ok) {
+                    throw new Error(`HTTP error! Status: ${response.status}. Check Network tab.`);
+                }
+
+                const blob = await response.blob();
+                currentBlobUrl = URL.createObjectURL(blob);
+                
+                audioPlayer.src = currentBlobUrl;
+                audioPlayer.load(); 
+                
+                audioPlayer.play().catch(error => {
+                    console.error("Autoplay failed. Please click play manually.", error);
+                    authStatusEl.innerHTML = '<span class="text-red-400">Autoplay blocked. Click play on the audio bar.</span>';
+                });
+
+                // Success! Revert status
+                authStatusEl.innerHTML = '<span class="text-green-400">Connected to Drive</span>';
+
+            } catch (error) {
+                console.error("Failed to stream audio:", error);
+                authStatusEl.innerHTML = `<span class="text-red-400">Stream Error: ${error.message}</span>`;
+                audioPlayer.pause();
+                audioPlayer.src = '';
+            }
+        }
+
+
+        function playTrack(trackIndex) {
+            if (trackIndex < 0 || trackIndex >= currentPlaylist.length) return;
+            if (!accessToken) {
+                authStatusEl.innerHTML = '<span class="text-red-400">Sign in required to play!</span>';
+                console.warn("User is not signed in to stream music.");
+                return;
+            }
+            
+            const track = currentPlaylist[trackIndex];
+            fetchAndPlayTrack(track, trackIndex);
+        }
+
+        function addToPlaylist(track) {
+            currentPlaylist.push(track);
+            renderPlaylist();
+        }
+
+        function playAllInFolder(tracks) {
+            currentPlaylist = []; // Clear current playlist
+            currentTrackIndex = -1; // Reset index
+
+            tracks.forEach(file => {
+                 const track = { id: file.id, name: file.name, artist: 'Drive Folder', art: '🎵' };
+                 currentPlaylist.push(track);
+            });
+            
+            renderPlaylist();
+            
+            if (currentPlaylist.length > 0) {
+                playTrack(0); // Start playing the first track
+            }
+        }
+
+        function playNextTrack() {
+            if (currentPlaylist.length === 0) return;
+            const nextIndex = (currentTrackIndex + 1) % currentPlaylist.length;
+            playTrack(nextIndex);
+        }
+
+
+        // --- UI RENDERING ---
+
+        /**
+         * Renders the navigation controls (Up button and current folder name).
+         */
+        async function renderNavigation(currentId) {
+            navigationPanel.innerHTML = ''; // Clear previous content
+
+            let currentFolderName = (currentId === 'root') ? 'My Drive Root' : 'Loading...';
+            let parentId = null;
+
+            // 1. Get the current folder name and parent ID
+            try {
+                const response = await gapi.client.drive.files.get({
+                    fileId: currentId,
+                    fields: 'name, parents'
+                });
+                currentFolderName = response.result.name || currentFolderName;
+                parentId = response.result.parents ? response.result.parents[0] : null;
+            } catch (error) {
+                console.warn("Could not fetch current folder metadata, possibly due to root:", error);
+                if (currentId === rootFolderId) {
+                     currentFolderName = CUSTOM_ROOT_FOLDER_NAME || 'Music Root';
+                }
+            }
+
+            const headerDiv = document.createElement('div');
+            headerDiv.className = 'flex items-center space-x-3 mb-2';
+
+            // 2. BACK/UP Button (Only show if we are NOT at the root ceiling)
+            const isAtRootCeiling = currentId === rootFolderId;
+            
+            if (!isAtRootCeiling) {
+                const upButton = document.createElement('button');
+                upButton.className = 'text-indigo-400 hover:text-indigo-300 transition duration-150 p-1 rounded-md bg-gray-600 shadow-lg flex-shrink-0';
+                upButton.title = 'Go up one level';
+                upButton.onclick = () => goToParent(currentId);
+                
+                upButton.innerHTML = `
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
+                        <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.805a.75.75 0 00-1.214-.882l-3.41 4.26V6.75a.75.75 0 00-1.5 0v5.625c0 .061.026.12.071.166l.07.085 4.5 5.625a.75.75 0 00.932-.086z" clip-rule="evenodd" />
+                    </svg>
+                `;
+                headerDiv.appendChild(upButton);
+            }
+            
+            // 3. CURRENT FOLDER NAME
+            const nameEl = document.createElement('p');
+            nameEl.className = 'text-lg font-semibold truncate text-white';
+            nameEl.textContent = currentFolderName;
+            headerDiv.appendChild(nameEl);
+
+            navigationPanel.appendChild(headerDiv);
+            
+            // 4. Re-append the search bar after the navigation header
+            navigationPanel.appendChild(searchBar);
+        }
+
+
+        function renderFileList(files) {
+            fileListContainer.innerHTML = ''; // Clear previous list
+            
+            const audioFiles = files.filter(f => f.mimeType.includes('audio/'));
+            
+            if (audioFiles.length > 0) {
+                 const playAllButton = document.createElement('button');
+                 playAllButton.className = 'w-full mb-3 py-2 bg-green-600 hover:bg-green-700 rounded-md text-white font-medium transition duration-150 shadow-lg';
+                 playAllButton.textContent = `▶️ Play All ${audioFiles.length} Tracks`;
+                 playAllButton.onclick = () => playAllInFolder(audioFiles);
+                 fileListContainer.appendChild(playAllButton);
+                 
+                 const separator = document.createElement('div');
+                 separator.className = 'border-t border-gray-600 mb-2';
+                 fileListContainer.appendChild(separator);
+            }
+            
+            files.forEach(file => {
+                const isFolder = file.mimeType === 'application/vnd.google-apps.folder';
+                const icon = isFolder ? '📁' : '🎵'; 
+                const title = file.name.replace(/\.(mp3|flac|wav|ogg)$/i, '');
+                
+                const item = document.createElement('div');
+                item.className = 'flex justify-between items-center p-3 hover:bg-gray-600 transition duration-150 cursor-pointer';
+                
+                if (isFolder) {
+                    item.onclick = () => openFolder(file.id);
+                    item.innerHTML = `
+                        <div class="flex-1 min-w-0 flex items-center">
+                            <span class="text-lg mr-3">${icon}</span>
+                            <div class="min-w-0">
+                                <p class="text-sm font-medium truncate text-white">${title}</p>
+                                <p class="text-xs text-indigo-400">Folder</p>
+                            </div>
+                        </div>
+                    `;
+                } else {
+                    const track = { id: file.id, name: file.name, artist: 'Drive Folder', art: icon };
+                    item.innerHTML = `
+                        <div class="flex-1 min-w-0">
+                            <p class="text-sm font-medium truncate text-white">${icon} ${title}</p>
+                            <p class="text-xs text-gray-400">${track.artist}</p>
+                        </div>
+                        <button class="text-sm text-green-400 hover:text-green-300 ml-4 p-1 rounded-full hover:bg-gray-500" title="Add to Playlist">
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
+                                <path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" />
+                            </svg>
+                        </button>
+                    `;
+                    item.querySelector('button').onclick = (e) => { e.stopPropagation(); addToPlaylist(track); };
+                }
+                
+                fileListContainer.appendChild(item);
+            });
+        }
+
+
+        function renderPlaylist() {
+            playlistContainer.innerHTML = '';
+            if (currentPlaylist.length === 0) {
+                 playlistContainer.innerHTML = '<p class="p-3 text-gray-400 text-sm">Add tracks from the library to build your playlist.</p>';
+                 return;
+            }
+
+            currentPlaylist.forEach((track, index) => {
+                const isPlaying = index === currentTrackIndex;
+                const item = document.createElement('div');
+                item.className = `flex justify-between items-center p-3 transition duration-150 cursor-pointer ${isPlaying ? 'bg-indigo-900 border-l-4 border-indigo-400' : 'hover:bg-gray-600'}`;
+                
+                item.innerHTML = `
+                    <div class="flex-1 min-w-0 flex items-center" onclick="playTrack(${index})">
+                        <span class="mr-3 text-lg">${isPlaying ? '▶️' : (track.art || '🎵')}</span>
+                        <div class="min-w-0">
+                            <p class="text-sm font-medium truncate ${isPlaying ? 'text-white' : 'text-gray-200'}">${track.name.replace(/\.(mp3|flac|wav|ogg)$/i, '')}</p>
+                            <p class="text-xs ${isPlaying ? 'text-indigo-300' : 'text-gray-400'}">${track.artist || 'Drive Folder'}</p>
+                        </div>
+                    </div>
+                    <button class="text-sm text-red-400 hover:text-red-300 ml-4 p-1 rounded-full hover:bg-gray-500" title="Remove from Playlist">
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
+                            <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM6.75 9.25a.75.75 0 000 1.5h6.5a.75.75 0 000-1.5h-6.5z" clip-rule="evenodd" />
+                        </svg>
+                    </button>
+                `;
+                item.querySelector('button').onclick = (e) => { 
+                    e.stopPropagation();
+                    currentPlaylist.splice(index, 1);
+                    if (index === currentTrackIndex) {
+                        currentTrackIndex = -1; // Reset playing index if current track is removed
+                        audioPlayer.pause();
+                        currentTitleEl.textContent = 'Select a track to play';
+                        currentArtistEl.textContent = 'Playlist updated';
+                    } else if (index < currentTrackIndex) {
+                        currentTrackIndex--; // Adjust index if track removed before current one
+                    }
+                    renderPlaylist();
+                };
+                
+                playlistContainer.appendChild(item);
+            });
+        }
+
+
+        // --- MAIN INITIALIZATION (Runs AFTER all HTML elements are loaded) ---
+        document.addEventListener('DOMContentLoaded', () => {
+            // Assign DOM elements to global variables
+            authButton = document.getElementById('authButton');
+            authStatusEl = document.getElementById('authStatus');
+            signoutButton = document.getElementById('signoutButton');
+            searchBar = document.getElementById('searchBar');
+            audioPlayer = document.getElementById('audioPlayer');
+            fileListContainer = document.getElementById('fileList');
+            playlistContainer = document.getElementById('playlist');
+            currentTitleEl = document.getElementById('currentTitle');
+            currentArtistEl = document.getElementById('currentArtist');
+            navigationPanel = document.getElementById('navigationPanel');
+            
+            // NOW the audioPlayer is defined, we can attach the listener
+            audioPlayer.addEventListener('ended', playNextTrack);
+
+            // Set flag that DOM is ready. Now maybeInitApp can safely use the elements.
+            isDomReady = true; 
+            
+            // Set initial status and attempt to initialize
+            maybeInitApp(); 
+            
+            // Initial playlist render
+            renderPlaylist(); 
+        });
+
+    </script>
+</body>
+</html>
